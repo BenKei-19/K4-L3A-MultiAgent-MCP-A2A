@@ -9,6 +9,7 @@ from pathlib import Path
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
+from .evidence import tool_domain
 from .mcp_gateway import connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
@@ -23,11 +24,18 @@ async def _show_tools(root: Path) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        for tool in await gateway.list_tools():
-            print(tool)
+        for spec in await gateway.describe_tools():
+            params = ", ".join(
+                f"{name}{'*' if name in spec.required else ''}"
+                + (f"={'|'.join(spec.enums[name])}" if name in spec.enums else "")
+                for name in spec.params
+            )
+            print(f"{spec.name} [{tool_domain(spec) or '?'}] ({params})")
+            if spec.description:
+                print(f"    {spec.description.strip().splitlines()[0][:160]}")
 
 
-async def _run(root: Path) -> None:
+async def _run(root: Path, dump_evidence: Path | None = None) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -47,7 +55,13 @@ async def _run(root: Path) -> None:
         for case_id in case_set.case_ids:
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
+            output = await solve_case(case, gateway, trace, debug_dir=dump_evidence)
+            print(
+                f"{case_id}: {output['assessment']['primary_issue']} / "
+                f"{output['assessment']['case_status']} / "
+                f"refund {output['financial_resolution']['recommended_refund_brl']:.2f}",
+                flush=True,
+            )
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")
@@ -66,7 +80,12 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--dump-evidence",
+        metavar="DIR",
+        help="also write raw MCP evidence per case to DIR (local debugging only)",
+    )
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -86,7 +105,8 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            dump = (root / args.dump_evidence).resolve() if args.dump_evidence else None
+            asyncio.run(_run(root, dump))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")
